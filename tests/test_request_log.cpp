@@ -44,7 +44,14 @@ int main() {
     options.api_key                        = "must-not-appear";
     options.model_id_override              = "deployment-alias";
     options.request_log_jsonl              = "requests.jsonl";
+    // A tp 2 server, so the record's tensor-parallel fields carry a real two-device list.
+    options.tp                             = 2;
+    options.devices                        = {0, 1};
     options.max_context                    = 262144;
+    // A yarn-mode server, so the record's rope fields carry real values rather than defaults.
+    options.rope_mode                      = ninfer::RopeMode::Yarn;
+    options.yarn_factor                    = 4.0;
+    options.yarn_origin                    = 262144;
     options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
@@ -77,6 +84,9 @@ int main() {
 
     ninfer::MemorySummary memory;
     memory.max_context                       = 262144;
+    memory.rope_mode                         = ninfer::RopeMode::Yarn;
+    memory.effective_max_context             = 1048576;
+    memory.yarn_mscale                       = 1.138629436111989;
     memory.kv_capacity_mode                  = ninfer::KvCapacityMode::Explicit;
     memory.kv_capacity                       = 524288;
     memory.kv_capacity_page_groups           = 8192;
@@ -122,7 +132,40 @@ int main() {
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    // Tensor-parallel identity. Every other engine/memory field is rank 0's, so
+    // `tp`/`devices` are what let a reader attribute the record to a dual-device run.
+    failures += check(server.at("engine").at("tp") == 2, "tensor-parallel width missing");
+    failures += check(server.at("engine").at("devices") == Json::array({0, 1}),
+                      "tensor-parallel device list missing");
+
+    // The single-device record must still name its one device in `devices`, so a consumer can read
+    // the list unconditionally instead of falling back to `device` at tp 1.
+    {
+        ServeOptions tp1  = options;
+        tp1.tp            = 1;
+        tp1.device        = 3;
+        tp1.devices       = {3};
+        const Json single = Json::parse(format_server_start_json(
+            "serve-test", 1000, tp1, sampling_defaults, "deployment-alias", load, memory,
+            environment, std::uint64_t{123456}));
+        failures += check(single.at("engine").at("tp") == 1, "tp 1 width missing");
+        failures += check(single.at("engine").at("devices") == Json::array({3}),
+                          "tp 1 device list missing or not the primary device");
+        failures += check(single.at("engine").at("device") == 3,
+                          "tp 1 primary device disagrees with the device list");
+    }
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
+    // Rotary regime. `effective_max_context` and `yarn_mscale` come from the constructed
+    // program, the other three echo the server's own options; docs/serving.md promises all five, so
+    // a dropped key is a documentation defect as much as a logging one.
+    failures += check(server.at("engine").at("rope_mode") == "yarn", "rope mode missing");
+    failures += check(server.at("engine").at("yarn_factor") == 4.0, "yarn factor missing");
+    failures += check(server.at("engine").at("yarn_origin") == 262144, "yarn origin missing");
+    failures += check(server.at("engine").at("effective_max_context") == 1048576,
+                      "effective max context missing");
+    failures += check(server.at("engine").at("yarn_mscale") > 1.13 &&
+                          server.at("engine").at("yarn_mscale") < 1.15,
+                      "yarn mscale missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
                           server.at("engine").at("kv_capacity_page_groups") == 8192 &&
                           server.at("engine").at("kv_capacity_max_page_groups") == 16384,

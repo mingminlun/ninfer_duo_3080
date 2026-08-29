@@ -79,8 +79,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
-    constexpr int PageIds         = 64;
+    constexpr int PageIds         = kGqaSmallTSplitPageIds<Geometry, Bc>;
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;
@@ -97,6 +96,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // 64-dimension group at a time instead of carrying all eight fragments in
     // registers across the whole kernel. The main arena holds K i8, V i8, and
     // V bf16 during the key loop.
+    // Occupancy guard: `MinBlocksPerSm` is this instantiation's own `__launch_bounds__` target and
+    // `PageIds` scales with the Op's visible-key domain. The dynamic arena counts against the same
+    // per-SM budget as the static arrays. See kGqaDecodeSharedResidencyBytes.
+    constexpr int DynamicSharedBytes = DynamicArena ? 4 * Bc * D : 0;
+    constexpr int StaticSharedBytes =
+        gqa_shared_align16(Br * D) +                                    // q_s (int8)
+        gqa_shared_align16(DynamicArena ? 16 : 4 * Bc * D) +            // static_r_s (int8)
+        gqa_shared_align16(Br * Bc * static_cast<int>(sizeof(__nv_bfloat16))) +      // p_s
+        gqa_shared_align16(Br * static_cast<int>(sizeof(float))) +                   // alpha_s
+        2 * gqa_shared_align16(Bc * Groups * static_cast<int>(sizeof(__half))) +     // k/v scales
+        gqa_shared_align16(PageIds * static_cast<int>(sizeof(std::int32_t)));        // page ids
+    static_assert((StaticSharedBytes + DynamicSharedBytes) * MinBlocksPerSm <=
+                      kGqaDecodeSharedResidencyBytes,
+                  "INT8 decode CTA shared memory no longer fits its MinBlocksPerSm target on one "
+                  "SM -- raising kGqaAttentionMaximumVisibleKeys grew the page-id staging past the "
+                  "residency budget; retune the split policy or the budget deliberately");
+
     __shared__ __align__(16) std::int8_t q_s[Br * D];
     __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 4 * Bc * D];
     extern __shared__ __align__(16) std::int8_t dynamic_r_s[];

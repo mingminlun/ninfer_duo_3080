@@ -137,9 +137,14 @@ measured recommendation rather than a semantic limit.
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
+| `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
+| `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
+| `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
+| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
@@ -149,6 +154,7 @@ measured recommendation rather than a semantic limit.
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
+| `--ignore-eos` | drop the checkpoint's own end-of-turn token ids from the request stop policy | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
 | `--top-k N` | top-k-threshold override | registered model/mode default |
@@ -176,14 +182,65 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
 generated token IDs in diagnostics.
 
+`--ignore-eos` removes the checkpoint's registered `eos_token_id` set from the request stop policy,
+so decode continues until `--max-new` is exhausted or the remaining context capacity is reached
+(`finish reason` `output-limit` or `context-capacity`) instead of ending on the model's end-of-turn
+token. Stop conditions added with `--stop-token-id`, `--stop`, and `--reasoning-stop` are
+unaffected. This exists for fixed-length decode work such as sustained long-context soak and
+throughput measurement; normal use should leave it off, because generation past the end-of-turn
+token is off-distribution and its text is not a product output.
+
 Run `./build/apps/ninfer --help` for the exact option contract.
+
+## Dual-GPU execution
+
+`--tp 2` splits one resident model across two CUDA devices and requires an explicit `--devices A,B`
+naming two distinct devices of the same compute capability. `--device` alone selects the single
+device used at the default `--tp 1`; when both are given they must agree on the primary device.
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 262144 --kv-dtype int8 --kv-capacity auto \
+  --messages long_prompt.json --max-new 256 --no-thinking
+```
+
+Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
+`qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
+`--tp 2` at startup, as do `--spec dflash` and `--vision`. `--spec mtp` is supported at `--tp 2`,
+with one behavioral difference: compatible-prefix reuse is downgraded to a full prefill, because
+the MTP head resumes from a retained target hidden state that only the primary device holds. The
+answer is unchanged; only the reuse saving is lost.
+
+The load summary reports weights, KV pool, GDN state, sequence, workspace, CUDA Graph and reserved
+bytes per device, plus a free/total row for each. `--no-cuda-graph` runs decode eagerly; at `--tp 2`
+that is the same two-stream forward pass without a captured graph, and the tokens are identical.
+`--tp 1` is bit-identical to single-device execution.
+
+Speculative decoding at `--tp 2` is output-equivalent to non-speculative decoding rather than
+bit-identical: a verify round evaluates the target model over `draft_tokens + 1` columns at once
+while an ordinary round evaluates one, which selects different GEMM shapes, so greedy streams can
+diverge on a near-tie token. Every committed token is still one the target model's own argmax
+selected.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical
+The registered model IDs have a native context limit of 262,144 tokens, which is the ceiling
+`--max-context` is checked against under the default `--rope native`. `--rope yarn` applies YaRN
+frequency correction and raises that ceiling to `--yarn-origin` x `--yarn-factor`, up to 1,048,576
+tokens; `--yarn-origin` must equal the registered native capacity (262,144); `--yarn-factor`
+accepts a finite value in [1.0, 64.0] and defaults to 4.0. YaRN works at either `--tp` width and is
+rejected together with `--vision`, `--spec dflash`, or a target with no YaRN rope domain
+(`qwen3.6-35b-a3b`). The load summary's
+`rope` row reports the resolved mode, factor, origin, effective ceiling and `mscale`. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
+Use `--kv-dtype int8` for large context allocations; at `--max-context 1048576` it is mandatory,
+because a BF16 pool at that window does not fit two RTX 5090s. The 1,048,576-token configuration is
+`--tp 2 --devices A,B --rope yarn --yarn-factor 4.0 --yarn-origin 262144 --kv-dtype int8
+--kv-capacity auto`; it reserves 26.93 GiB per device without a speculative backend and 28.42 GiB
+with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes about 19 minutes on the measured
+host. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

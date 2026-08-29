@@ -70,8 +70,22 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // Rotary regime. Nothing in the persistent or workspace layout depends on these:
+    // the YaRN table is a 32-float per-device buffer the Program owns outside the planned arenas,
+    // so a native plan is byte-identical to the pre-YaRN one. They are carried here only so the
+    // Program can build and upload that table without re-reading EngineOptions.
+    RopeMode rope_mode                  = RopeMode::Native;
+    double yarn_factor                  = 0.0;
+    std::uint32_t yarn_origin           = 0;
+    // The ceiling `capacity` was admitted against: the variant's native capacity under Native,
+    // `yarn_origin * yarn_factor` under Yarn.
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     int device          = 0;
+    // Tensor-parallel width. Every per-device geometry below (KV heads, GDN value heads, GDN conv
+    // channels) is the model's own extent divided by `tp`, because each device holds only its own
+    // head shard. Page COUNTS are not divided: all devices carry the same pages.
+    int tp = 1;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -92,8 +106,14 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
+    // See SequencePlanningInputs: rope regime carried through the plan, layout-neutral.
+    RopeMode rope_mode                  = RopeMode::Native;
+    double yarn_factor                  = 0.0;
+    std::uint32_t yarn_origin           = 0;
+    std::uint32_t effective_max_context = 0;
     bool use_cuda_graph = true;
     int device          = 0;
+    int tp              = 1;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

@@ -35,13 +35,25 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int QKKs    = D / 16;
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
-    constexpr int PageIds       = 64;
+    constexpr int PageIds       = kGqaSmallTSplitPageIds<Geometry, Bc>;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
 
     static_assert(QkvRows >= Br);
+
+    // Occupancy guard: this kernel's `__launch_bounds__` asks for two CTAs per SM, and `PageIds`
+    // scales with the Op's visible-key domain. See kGqaDecodeSharedResidencyBytes.
+    constexpr int MinBlocksPerSm = 2;
+    constexpr int Bf16Bytes      = static_cast<int>(sizeof(__nv_bfloat16));
+    constexpr int SharedBytes = gqa_shared_align16(QkvRows * D * Bf16Bytes) +          // qkv_s
+                                gqa_shared_align16(Wc * 16 * Bc * Bf16Bytes) +         // p_s
+                                gqa_shared_align16(PageIds *
+                                                   static_cast<int>(sizeof(std::int32_t)));
+    static_assert(SharedBytes * MinBlocksPerSm <= kGqaDecodeSharedResidencyBytes,
+                  "BF16 decode CTA shared memory no longer fits its MinBlocksPerSm target on one "
+                  "SM -- raising kGqaAttentionMaximumVisibleKeys grew the page-id staging past the "
+                  "residency budget; retune the split policy or the budget deliberately");
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];

@@ -15,6 +15,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `ops/linear_add/`, `ops/linear_pair/`, `ops/linear_swiglu/` — fused-Op suites split by registered
   weight/activation profile, each evaluating its complete formula rather than composing production
   Ops;
+- `ops/test_allreduce.cpp` — the two-device `allreduce_sum`/`allgather_rows` collectives; it needs
+  two CUDA devices visible to one process and reports the shared skip code when fewer are present;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;

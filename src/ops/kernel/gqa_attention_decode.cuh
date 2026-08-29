@@ -11,6 +11,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ninfer/ops/gqa_attention.h"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -20,6 +21,60 @@
 namespace ninfer::ops {
 
 inline constexpr int kGqaHeadDim = 256;
+
+// The SM shared-memory residency budget the split-KV decode kernels are tuned against.
+//
+// sm_120 offers 100 KiB of shared memory per SM to a CTA carveout, and every decode instantiation
+// carries an explicit `MinBlocksPerSm` in its `__launch_bounds__` -- 2 for the long-window profiles
+// that matter here. If the sum of one CTA's shared memory times that occupancy target ever exceeds
+// this, the hardware silently drops to fewer CTAs per SM instead of failing: a performance cliff
+// with no diagnostic. `kGqaSmallTSplitPageIds` grows with `kGqaAttentionMaximumVisibleKeys`, so
+// widening the Op's visible-key domain is exactly the edit that could walk into that cliff. Both
+// kernels therefore static_assert their own total against this constant.
+//
+// At the 1,048,576-key domain, by this same conservative accounting (per CTA, static + dynamic,
+// times MinBlocksPerSm), the five largest reachable instantiations are:
+//   i8   24|4 TokenTile 6, Wc 6,  Bc 32, static arena,  PageIds 194, MinBlocks 2 -> 99,232 B
+//   i8   12|2 TokenTile 6, Wc 6,  Bc 32, static arena,  PageIds  98, MinBlocks 2 -> 98,464 B
+//   i8   24|4 TokenTile 5, Wc 8,  Bc 32, static arena,  PageIds 194, MinBlocks 2 -> 88,864 B
+//   i8   24|4 TokenTile 6, Wc 12, Bc 64, dynamic arena, PageIds 194, MinBlocks 1 -> 85,984 B
+//   bf16 24|4 TokenTile 6, Wc 4,  Bc 32,                PageIds 194, MinBlocks 2 -> 75,296 B
+// The tightest is 99,232 of 102,400 B: ~3.1 KiB of headroom, all of it consumed by the page-id
+// staging, which is 776 B of that CTA. Doubling the domain again to 2,097,152 keys stays inside
+// the budget; quadrupling it does not, and fails to compile here (verified) rather than halving
+// occupancy in silence.
+inline constexpr int kGqaDecodeSharedResidencyBytes = 100 * 1024;
+
+// Shared-memory arrays are laid out with 16-byte alignment; rounding each one up is the
+// conservative accounting (it can only over-estimate the total).
+// `__host__ __device__` so a kernel body may evaluate it in a constant expression: nvcc refuses to
+// call a host-only constexpr function from a `__global__` function even in a static_assert.
+[[nodiscard]] __host__ __device__ inline constexpr int gqa_shared_align16(int bytes) {
+    return ((bytes + 15) / 16) * 16;
+}
+
+// Upper bound on the physical page ids ONE split stages in shared memory, derived from the Op's
+// declared visible-key domain instead of hard-coded.
+//
+// A split covers `ceil(ceil(window / KeyBlock) / active_splits) * KeyBlock` keys (see the
+// `units_per_split` computation in both partial kernels). `active_splits` saturates at
+// `Geometry::DecodeSplits`, so the span grows linearly with the window past that point and its
+// maximum over the whole declared domain is reached at `kGqaAttentionMaximumVisibleKeys`. The
+// trailing `+ 1` covers a split whose first key tile starts mid-page (KeyBlock < page size).
+//
+// At the 1,048,576-key domain this is 194 ids (776 B) for a DecodeSplits == 85 geometry and 98
+// (392 B) for the head-local DecodeSplits == 170 one; the pre-YaRN 262,144-key domain needed 50.
+// Getting this wrong is a shared-memory overrun, not a wrong answer, which is why it is computed
+// from the same constant the wrapper validates envelopes against.
+template <typename Geometry, int KeyBlock>
+inline constexpr int kGqaSmallTSplitPageIds =
+    (((((static_cast<int>(kGqaAttentionMaximumVisibleKeys) + KeyBlock - 1) / KeyBlock) +
+       Geometry::DecodeSplits - 1) /
+      Geometry::DecodeSplits) *
+         KeyBlock +
+     static_cast<int>(kPagedKVPageSize) - 1) /
+        static_cast<int>(kPagedKVPageSize) +
+    1;
 
 struct GqaAppendInput {
     static constexpr bool writes_cache = true;

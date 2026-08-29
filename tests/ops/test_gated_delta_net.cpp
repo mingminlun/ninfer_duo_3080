@@ -1,5 +1,6 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "ops/gdn_criteria.h"
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
 
@@ -21,16 +22,6 @@ using namespace ninfer::test;
 namespace {
 
 constexpr int kStateDim = 128;
-
-constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
-    return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/5.0e-6,
-            /*gross_relative_to_max_reference=*/5.5e-3};
-}
-
-constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
-    return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
-            /*gross_relative_to_max_reference=*/3.9e-3};
-}
 
 struct Case {
     const char* name;

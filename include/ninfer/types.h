@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -56,6 +57,19 @@ enum class ProposalHead : std::uint8_t {
     Optimized,
 };
 
+// Rotary position-embedding regime. `Native` is the checkpoint's own RoPE: the registered native
+// context capacity is the ceiling and nothing about the rope path changes. `Yarn` applies YaRN
+// frequency correction (`--yarn-factor` x `--yarn-origin`), which raises the addressable context
+// ceiling to `yarn_origin * yarn_factor` and substitutes a corrected inverse-frequency table plus
+// an `mscale` multiplier inside the rope kernels. Native is bit-for-bit the pre-YaRN path.
+enum class RopeMode : std::uint8_t {
+    Native,
+    Yarn,
+};
+
+// Product ceiling on any YaRN-extended context, independent of factor/origin.
+inline constexpr std::uint32_t kMaximumYarnContext = 1048576;
+
 enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
@@ -74,8 +88,26 @@ struct LoadProgress {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
-    int device                         = 0;
+    int device = 0;
+    // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
+    // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
+    // the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
+    // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
+    // `SpeculativeBackend::DFlash`, and `enable_vision` are rejected at construction. `tp == 1`
+    // is bit-identical to the single-device path.
+    int tp = 1;
+    // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
+    // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
+    // non-empty its size must equal tp.
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    // Rotary regime. `RopeMode::Yarn` raises the ceiling `max_context` is validated against from
+    // the variant's registered native capacity to `yarn_origin * yarn_factor` (capped at
+    // `kMaximumYarnContext`); `yarn_origin` must equal that registered native capacity. Native
+    // leaves every rope call site on the checkpoint's own constant frequency table.
+    RopeMode rope_mode                 = RopeMode::Native;
+    double yarn_factor                 = 4.0;
+    std::uint32_t yarn_origin          = 262144;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -412,6 +444,12 @@ struct ArenaMemorySummary {
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
+    // Rotary regime as the target runtime resolved it. `effective_max_context` is the ceiling
+    // `max_context` was admitted against; `yarn_mscale` is the rope-path cos/sin multiplier the
+    // corrected frequency table carries (exactly 1 under `RopeMode::Native`).
+    RopeMode rope_mode                        = RopeMode::Native;
+    std::uint32_t effective_max_context       = 0;
+    double yarn_mscale                        = 1.0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;
@@ -430,8 +468,38 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
+    // Graph residency measured on THIS device (rank 0). The allowance above is a per-device
+    // budget, so both figures are per-device and neither is a total to be divided.
     std::size_t cuda_graph_observed_bytes         = 0;
+    // Graph residency measured on rank 1, and 0 at tp == 1. A tensor-parallel decode program is a
+    // single cross-device graph, but instantiating it materializes driver and module state on both
+    // devices, so the second device carries its own cost against the same allowance.
+    std::size_t cuda_graph_peer_observed_bytes    = 0;
+    // Node count of one captured decode graph, 0 when graphs are disabled. At tp 2 a single graph
+    // holds BOTH devices' nodes plus the collectives' cross-device copies (the event edges between
+    // them are edges, not nodes), so this is roughly twice the tp 1 count and is the direct
+    // measurement of whether the peer's half of the schedule was captured.
+    std::size_t cuda_graph_node_count             = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // GDN (linear-attention) recurrent + convolution state for THIS device. At tp 2 the head split
+    // halves it, so it is reported separately from the rest of the sequence arena.
+    std::size_t gdn_state_bytes = 0;
+};
+
+// One row of the per-device memory table the load summary prints. At tp == 1 only `devices[0]` is
+// meaningful. Every byte count is measured or planned for that device specifically -- nothing here
+// is a model total divided by the tensor-parallel width.
+struct DeviceMemoryReport {
+    int device                              = -1;
+    std::uint64_t weights_bytes             = 0; // this device's weight arena (its own shard)
+    std::uint64_t kv_pool_bytes             = 0; // paged KV payload
+    std::uint64_t gdn_state_bytes           = 0; // GDN recurrent + conv state
+    std::uint64_t sequence_bytes            = 0; // whole persistent arena (KV + GDN + round state)
+    std::uint64_t workspace_bytes           = 0; // workspace arena capacity
+    std::uint64_t cuda_graph_bytes          = 0; // measured graph residency on THIS device
+    std::uint64_t reserved_bytes            = 0; // weights + runtime reservation
+    std::uint64_t free_after_startup_bytes  = 0;
+    std::uint64_t total_bytes               = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
@@ -451,6 +519,17 @@ struct RuntimeStats {
 };
 
 struct LoadSummary {
+    int tp = 1;
+    std::array<DeviceMemoryReport, 2> devices{};
+    // Rotary regime resolved at construction. `effective_max_context` is the ceiling `max_context`
+    // was validated against (the variant's native capacity under `RopeMode::Native`,
+    // `yarn_origin * yarn_factor` under `RopeMode::Yarn`); `yarn_mscale` is the rotary cos/sin
+    // multiplier the YaRN table carries and is exactly 1 under Native.
+    RopeMode rope_mode                    = RopeMode::Native;
+    double yarn_factor                    = 0.0;
+    std::uint32_t yarn_origin             = 0;
+    std::uint32_t effective_max_context   = 0;
+    double yarn_mscale                    = 1.0;
     std::string target;
     std::string model_id;
     std::string weights_id;

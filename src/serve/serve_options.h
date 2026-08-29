@@ -27,6 +27,11 @@ struct ServeOptions {
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
+    // Rotary regime, mirroring the CLI. `--rope yarn` raises the ceiling `--max-context` is
+    // checked against to `--yarn-origin x --yarn-factor`; Engine performs that check.
+    RopeMode rope_mode                     = RopeMode::Native;
+    double yarn_factor                     = 4.0;
+    std::uint32_t yarn_origin              = 262144;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
@@ -40,6 +45,10 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    int tp                                 = 1;
+    // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
+    // --devices, or synthesized as {device} when --devices is omitted).
+    std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;

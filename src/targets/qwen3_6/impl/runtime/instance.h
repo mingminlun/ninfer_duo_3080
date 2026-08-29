@@ -38,6 +38,12 @@ inline constexpr float kGdnScale                         = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
+// The variant's rope domain. `kNativeMaxContext` is the ONLY reader of
+// `Variant::maximum_context` in the family runtime; every context-derived extent sizes from the
+// EFFECTIVE ceiling that `detail::rope_effective_max_context` returns for it, which equals this
+// constant under `RopeMode::Native` and `yarn_origin * yarn_factor` under `RopeMode::Yarn`.
+inline constexpr std::uint32_t kNativeMaxContext = Variant::maximum_context;
+inline constexpr bool kSupportsYarnRope          = Variant::supports_yarn_rope;
 
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     return Variant::ordinary_graph_profiles(capacity);

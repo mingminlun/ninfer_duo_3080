@@ -38,6 +38,61 @@ server must accept image or video input. Speculative residency is likewise froze
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
 cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
 
+`--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
+distinct device per rank. It supports `--spec mtp` (with `--draft-tokens` and `--lm-head-draft`);
+it does not support `--spec dflash` or `--vision`, and both are rejected at startup with a message
+naming the unsupported feature.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 262144 --kv-capacity auto --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+### Extended context: `--rope yarn`
+
+`--rope native` (the default) runs the checkpoint's own rotary embedding and caps `--max-context`
+at the artifact's registered native position capacity, `262144`. `--rope yarn` applies YaRN
+frequency correction to the text rotary subspace and raises that ceiling to
+`--yarn-origin` x `--yarn-factor`, up to a product maximum of `1048576` tokens:
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --rope yarn --yarn-factor 4.0 --yarn-origin 262144 \
+  --max-context 1048576 --kv-capacity auto --kv-dtype int8
+```
+
+`--yarn-origin` must equal the artifact's registered native capacity (`262144`); a different origin
+is rejected at startup rather than silently reinterpreted, because the correction table is derived
+from that exact window. `--yarn-factor` accepts a finite value in `[1.0, 64.0]` and defaults to `4.0`;
+`origin x factor` must land on a whole number of tokens at or below `1048576`.
+
+YaRN is available at `--tp 1` as well as `--tp 2` -- the flag is independent of tensor parallelism,
+though the KV pool for a very long context is what usually decides which width fits. It is rejected
+together with `--vision` (the vision encoder ropes 2-D image-grid positions through its own table)
+and with `--spec dflash` (a different rotary geometry), and it is only offered by targets whose
+text attention carries a YaRN rope domain -- `qwen3.6-27b`/`qwen3.8-27b`; `qwen3.6-35b-a3b` rejects
+it at startup. Under `--rope native` nothing about the rope path changes, at either `--tp` width.
+
+The server's startup record and the CLI load summary both report the resolved regime: mode, factor,
+origin, the effective max-context ceiling, and the YaRN `mscale` multiplier.
+
+At the full `1048576` ceiling the configuration is single-slot: one sequence costs 16.66 GiB per
+device without a speculative backend and 17.69 GiB with `--spec mtp --draft-tokens 3`, so
+`--max-concurrency` must be `1` and a second slot cannot be allocated on a 32 GiB card. Concurrency
+at extended context requires a smaller `--max-context` (roughly 500,000 tokens for two slots at
+INT8 KV). `--kv-dtype int8` is mandatory at that window.
+
+One caveat applies to that combination: **prefix reuse is unavailable at `--tp 2` with
+`--spec mtp`**. Resuming a prefix drives the MTP head from a retained target hidden state that
+only the primary device holds, so such a request is prefilled again from the start instead of
+resumed. The answer is unchanged and no request fails -- only the reuse saving is lost, which
+matters for multi-turn conversations at long context. `--tp 2` without `--spec mtp` reuses
+prefixes normally except for a submission whose reusable prefix already covers the whole prompt,
+which is likewise downgraded to a full prefill.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -457,12 +512,17 @@ curl http://127.0.0.1:8080/v1/models \
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
+| `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
+| `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
+| `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
+| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
@@ -519,12 +579,16 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
+| `server_start` | target/weights identity and artifact, resolved Engine including tensor-parallel width `tp` and the resolved per-rank `devices` list, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+
+At `--tp 2` every other `engine` and `memory` field in `server_start` is the primary rank's; `tp`
+and `devices` are what identify the record as a dual-device run and name the second GPU. Per-device
+memory rows remain a console load-summary table rather than structured-log fields.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -639,3 +703,12 @@ decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+Generated text is always valid UTF-8. The checkpoint vocabulary is byte-level, so a single code
+point can span several generated tokens: the Engine holds an incomplete trailing sequence and
+publishes it in the delta that completes it, and no streamed chunk ever ends part-way through a
+code point. A generated byte sequence that no continuation can complete -- a byte-level token that
+can neither begin nor continue a code point, or a code point cut short by the output-token limit --
+is published as one U+FFFD replacement character per ill-formed sequence. This is a per-request
+text outcome: it never fails the request and never takes the server out of service. Token
+accounting is unaffected, since the generated token IDs remain exactly what the model produced.

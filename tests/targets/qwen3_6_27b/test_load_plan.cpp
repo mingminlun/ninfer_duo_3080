@@ -55,7 +55,7 @@ int verify_groupwise(const std::filesystem::path& path) {
     if (plan.materialization.object_count != 1124 ||
         plan.materialization.device_objects.size() != 1118 ||
         plan.materialization.host_objects.size() != 6 ||
-        plan.materialization.device_capacity_bytes == 0) {
+        plan.materialization.device_capacity_bytes[0] == 0) {
         std::cerr << "groupwise materialization plan is incomplete\n";
         return 1;
     }
@@ -99,7 +99,7 @@ int verify_nvfp4(const std::filesystem::path& path) {
         plan.materialization.object_count - plan.materialization.device_objects.size() -
                 plan.materialization.host_objects.size() !=
             247 ||
-        plan.materialization.device_capacity_bytes == 0) {
+        plan.materialization.device_capacity_bytes[0] == 0) {
         std::cerr << "NVFP4 materialization plan is incomplete: objects="
                   << plan.materialization.object_count
                   << " device=" << plan.materialization.device_objects.size()
@@ -173,7 +173,8 @@ int verify_rejection() {
 }
 
 int verify_profile_mismatch_rejection() {
-    ninfer::DeviceContext device(0);
+    ninfer::ExecutionContext execution({0});
+    ninfer::DeviceContext& device = execution.primary();
     ninfer::EngineOptions options;
     options.max_context    = 128;
     options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
@@ -186,7 +187,7 @@ int verify_profile_mismatch_rejection() {
     RuntimeModelView empty_model;
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device);
+            empty_model, nullptr, WeightsProfile::Qwen36Nvfp4, std::move(sequence), execution);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

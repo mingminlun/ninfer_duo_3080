@@ -138,6 +138,24 @@ private:
     bool reasoning_ends_in_newline_ = false;
 };
 
+// One line covering the whole rotary regime: which mode is active, the YaRN factor/origin that
+// produced the extended window, the ceiling `--max-context` was admitted against, and the rope-path
+// cos/sin multiplier the corrected table carries (1.0 under native). The ceiling is deliberately
+// NOT called "max context": the generation summary already prints a `max context` row carrying the
+// configured `--max-context`, and two rows under the same name meaning different things is how a
+// reader concludes the engine is running at 1,048,576 tokens when it is running at 4,096.
+std::string format_rope(const ninfer::LoadSummary& load) {
+    std::ostringstream out;
+    if (load.rope_mode == ninfer::RopeMode::Native) {
+        out << "native, ceiling " << load.effective_max_context;
+        return out.str();
+    }
+    out << std::fixed << std::setprecision(4);
+    out << "yarn factor " << load.yarn_factor << " origin " << load.yarn_origin << ", ceiling "
+        << load.effective_max_context << ", mscale " << load.yarn_mscale;
+    return out.str();
+}
+
 void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_stage("load", "engine construction", wall_seconds);
     print_stage("load", "artifact/materialize", load.load_seconds);
@@ -149,6 +167,21 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
+    print_metric("tensor parallel", std::to_string(load.tp) + (load.tp > 1 ? " (split)" : ""));
+    print_metric("rope", format_rope(load));
+    for (int rank = 0; rank < load.tp; ++rank) {
+        const ninfer::DeviceMemoryReport& row = load.devices[static_cast<std::size_t>(rank)];
+        const std::string label               = "gpu" + std::to_string(row.device);
+        print_metric(label + " weights", format_bytes(row.weights_bytes));
+        print_metric(label + " kv pool", format_bytes(row.kv_pool_bytes));
+        print_metric(label + " gdn state", format_bytes(row.gdn_state_bytes));
+        print_metric(label + " sequence", format_bytes(row.sequence_bytes));
+        print_metric(label + " workspace", format_bytes(row.workspace_bytes));
+        print_metric(label + " cuda graphs", format_bytes(row.cuda_graph_bytes));
+        print_metric(label + " reserved", format_bytes(row.reserved_bytes));
+        print_metric(label + " free/total", format_bytes(row.free_after_startup_bytes) + " / " +
+                                                format_bytes(row.total_bytes));
+    }
 }
 
 void print_generation_summary(const ninfer::GenerationResult& result,
@@ -251,6 +284,7 @@ int main(int argc, char** argv) {
         request.execution.requested_output_tokens = cli.max_new;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
+        request.stop.include_model_defaults       = !cli.ignore_eos;
         request.output.raw                        = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";
@@ -259,7 +293,12 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
+        engine_options.tp             = cli.tp;
+        engine_options.devices        = cli.devices;
         engine_options.max_context    = cli.max_context;
+        engine_options.rope_mode      = cli.rope_mode;
+        engine_options.yarn_factor    = cli.yarn_factor;
+        engine_options.yarn_origin    = cli.yarn_origin;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;

@@ -15,9 +15,8 @@ namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int ActiveTokens>
+template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = Fp8VocabularyGeometry;
     using Schedule = typename Fp8VocabularyA16MmaProductionSchedule<ActiveTokens>::Type;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
@@ -30,26 +29,40 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kFp8VocabularyFirstA16MmaT + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, kFp8VocabularyFirstA16MmaT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(
-    std::make_index_sequence<kFp8VocabularyLastA16MmaT - kFp8VocabularyFirstA16MmaT + 1>{});
+template <class Geometry>
+const auto& launchers() {
+    static constexpr auto kLaunchers = make_launchers<Geometry>(
+        std::make_index_sequence<kFp8VocabularyLastA16MmaT - kFp8VocabularyFirstA16MmaT + 1>{});
+    return kLaunchers;
+}
 
 } // namespace
 
 void launch_fp8_vocabulary_a16_mma(const Tensor& x, const Weight& weight, Tensor& out,
                                    cudaStream_t stream) {
-    if (weight.n != Fp8VocabularyGeometry::kOutputRows ||
-        weight.k != Fp8VocabularyGeometry::kInputRows || x.ne[1] < kFp8VocabularyFirstA16MmaT ||
-        x.ne[1] > kFp8VocabularyLastA16MmaT) {
+    if (x.ne[1] < kFp8VocabularyFirstA16MmaT || x.ne[1] > kFp8VocabularyLastA16MmaT) {
         throw std::invalid_argument("fp8 vocabulary A16 MMA: invalid exact problem");
     }
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kFp8VocabularyFirstA16MmaT);
-    kLaunchers[index](x, weight, out, stream);
+    if (weight.n == Fp8VocabularyGeometry::kOutputRows &&
+        weight.k == Fp8VocabularyGeometry::kInputRows) {
+        launchers<Fp8VocabularyGeometry>()[index](x, weight, out, stream);
+        return;
+    }
+    // TP2 column shard: the same kernel and the same measured per-T schedule instantiated at half
+    // the vocabulary rows, so the grid is exactly half the parent's and K is untouched.
+    if (weight.n == Fp8VocabularyTp2ColumnGeometry::kOutputRows &&
+        weight.k == Fp8VocabularyTp2ColumnGeometry::kInputRows) {
+        launchers<Fp8VocabularyTp2ColumnGeometry>()[index](x, weight, out, stream);
+        return;
+    }
+    throw std::invalid_argument("fp8 vocabulary A16 MMA: invalid exact problem");
 }
 
 } // namespace ninfer::ops::detail
