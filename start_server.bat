@@ -7,11 +7,12 @@ set "MODEL_PATH=E:\ninfer\model\qwen3_8_27b.ninfer"
 set "EXE_PATH=build\apps\ninfer-serve.exe"
 set "HOST=0.0.0.0"
 set "PORT=8000"
-set "DRAFT_TOKENS=2"
+set "DRAFT_TOKENS=3"
 set "MAX_CONTEXT=262144"
 set "KV_DTYPE=int8"
 set "MAX_CONCURRENCY=4"
 set "PENDING_TIMEOUT_MS=600000"
+set "PREFILL_CHUNK=2048"
 
 if not exist "%EXE_PATH%" (
     echo [ERROR] %EXE_PATH% not found.
@@ -26,15 +27,16 @@ if not exist "%MODEL_PATH%" (
 )
 
 echo ===============================================================
-echo   NInfer TP2 API Server (Dual RTX 3080 20GB + MTP 256K Context)
+echo   NInfer TP2 API Server (Dual RTX 3080 20GB + MTP3 256K Context)
 echo ===============================================================
 echo  Model       : %MODEL_PATH%
 echo  Host/Port   : http://%HOST%:%PORT%
 echo  Endpoints   : /v1/chat/completions , /v1/messages , /v1/models
 echo  Parallelism : Tensor Parallel TP=2 (Devices: 0, 1)
-echo  Speculative : MTP (Draft Tokens: %DRAFT_TOKENS%)
+echo  Speculative : MTP3 (Draft Tokens: %DRAFT_TOKENS%, ~45.6 tok/s)
 echo  Max Context : %MAX_CONTEXT% (256K Full Context)
 echo  KV Cache    : %KV_DTYPE% (8.38 GiB / GPU)
+echo  Prefill     : Chunk %PREFILL_CHUNK% tokens
 echo  Concurrency : %MAX_CONCURRENCY% active requests (Timeout: 600s)
 echo  Real-Time   : Prefill ^& Decode tok/s metrics enabled
 echo ===============================================================
@@ -49,6 +51,7 @@ echo.
     --draft-tokens %DRAFT_TOKENS% ^
     --max-context %MAX_CONTEXT% ^
     --kv-dtype %KV_DTYPE% ^
+    --prefill-chunk %PREFILL_CHUNK% ^
     --max-concurrency %MAX_CONCURRENCY% ^
     --pending-timeout-ms %PENDING_TIMEOUT_MS% ^
     --max-pending-requests 64 ^

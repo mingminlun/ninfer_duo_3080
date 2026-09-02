@@ -5,6 +5,7 @@ param (
     [int]$DraftTokens = 3,
     [int]$MaxContext = 262144,
     [string]$KvDtype = "int8",
+    [int]$PrefillChunk = 2048,
     [int]$MaxConcurrency = 4,
     [int]$PendingTimeoutMs = 600000,
     [string]$ApiKey = "",
@@ -28,15 +29,16 @@ if (-not (Test-Path $ModelPath)) {
 }
 
 Write-Host "===============================================================" -ForegroundColor Cyan
-Write-Host "  NInfer TP2 API Server (Dual RTX 3080 20GB + MTP 256K Context) " -ForegroundColor Green
+Write-Host "  NInfer TP2 API Server (Dual RTX 3080 20GB + MTP3 256K Context) " -ForegroundColor Green
 Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host " Model       : $ModelPath" -ForegroundColor Yellow
 Write-Host " Host/Port   : http://${HostIp}:${Port}" -ForegroundColor Yellow
 Write-Host " Endpoints   : /v1/chat/completions , /v1/messages , /v1/models" -ForegroundColor Yellow
 Write-Host " Parallelism : Tensor Parallel TP=2 (Devices: 0, 1)" -ForegroundColor Yellow
-Write-Host " Speculative : MTP (Draft Tokens: $DraftTokens)" -ForegroundColor Yellow
+Write-Host " Speculative : MTP3 (Draft Tokens: $DraftTokens, ~45.6 tok/s)" -ForegroundColor Yellow
 Write-Host " Max Context : $MaxContext (256K Full Context)" -ForegroundColor Yellow
 Write-Host " KV Cache    : $KvDtype (8.38 GiB / GPU)" -ForegroundColor Yellow
+Write-Host " Prefill     : Chunk $PrefillChunk tokens" -ForegroundColor Yellow
 Write-Host " Concurrency : $MaxConcurrency active requests (Timeout: 600s)" -ForegroundColor Yellow
 Write-Host " Real-Time   : Prefill & Decode tok/s metrics enabled" -ForegroundColor Yellow
 Write-Host "===============================================================" -ForegroundColor Cyan
@@ -52,6 +54,7 @@ $argsList = @(
     "--draft-tokens", "$DraftTokens",
     "--max-context", "$MaxContext",
     "--kv-dtype", "$KvDtype",
+    "--prefill-chunk", "$PrefillChunk",
     "--max-concurrency", "$MaxConcurrency",
     "--pending-timeout-ms", "$PendingTimeoutMs",
     "--max-pending-requests", "64",
