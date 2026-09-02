@@ -16,7 +16,12 @@ struct GqaGeometry {
     static constexpr int KVHeads          = KVHeadsValue;
     static constexpr int GroupSize        = QHeads / KVHeads;
     static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
+#if defined(NINFER_SM8X_COMPAT)
+    // GA102 (RTX 3080) has 68 SMs. With 2 KV heads, 34 * 2 = 68 CTAs (1 wave) or 68 * 2 = 136 CTAs (2 waves).
+    static constexpr int DecodeSplits     = 34 * DecodeSplitScale;
+#else
     static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
+#endif
 };
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;
