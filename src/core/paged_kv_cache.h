@@ -1,13 +1,13 @@
 #pragma once
 
 #include "core/layout.h"
+#include "core/span.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <vector>
 
 namespace ninfer {

@@ -462,7 +462,8 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    auto kkt_strip = [&]<int N_OWNED>() {
+    auto kkt_strip = [&](auto n_owned_tag) {
+        constexpr int N_OWNED = decltype(n_owned_tag)::value;
 #pragma unroll
         for (int k_tile = 0; k_tile < dims::K_TILES_PER_PANEL; ++k_tile) {
             const int k_off = k_tile * BF16_MMA_K;
@@ -502,16 +503,16 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
 
         switch (warp) {
         case 0:
-            kkt_strip.template operator()<1>();
+            kkt_strip(std::integral_constant<int, 1>{});
             break;
         case 1:
-            kkt_strip.template operator()<2>();
+            kkt_strip(std::integral_constant<int, 2>{});
             break;
         case 2:
-            kkt_strip.template operator()<3>();
+            kkt_strip(std::integral_constant<int, 3>{});
             break;
         case 3:
-            kkt_strip.template operator()<4>();
+            kkt_strip(std::integral_constant<int, 4>{});
             break;
         }
 
@@ -639,7 +640,9 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
 
     // === Phase WY-D: block-Schur off-diagonal completion (3 waves) ===
     // Switch on `warp` so (MY_W, MY_J) are compile-time per case.
-    auto wave_compute_store = [&]<int MY_W, int MY_J>() {
+    auto wave_compute_store = [&](auto my_w_tag, auto my_j_tag) {
+        constexpr int MY_W = decltype(my_w_tag)::value;
+        constexpr int MY_J = decltype(my_j_tag)::value;
         float out[8];
         compute_off_diag<MY_W, MY_J>(out, warp, lane, A_reg, scr_smem, M_view);
         store_frag_to_M(out, MY_W, MY_J, lane_g, lane_t, M_view);
@@ -647,28 +650,30 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
 
     switch (warp) {
     case 1:
-        wave_compute_store.template operator()<1, 0>();
+        wave_compute_store(std::integral_constant<int, 1>{}, std::integral_constant<int, 0>{});
         break;
     case 2:
-        wave_compute_store.template operator()<2, 1>();
+        wave_compute_store(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{});
         break;
     case 3:
-        wave_compute_store.template operator()<3, 2>();
+        wave_compute_store(std::integral_constant<int, 3>{}, std::integral_constant<int, 2>{});
         break;
     }
     __syncthreads();
 
     switch (warp) {
     case 2:
-        wave_compute_store.template operator()<2, 0>();
+        wave_compute_store(std::integral_constant<int, 2>{}, std::integral_constant<int, 0>{});
         break;
     case 3:
-        wave_compute_store.template operator()<3, 1>();
+        wave_compute_store(std::integral_constant<int, 3>{}, std::integral_constant<int, 1>{});
         break;
     }
     __syncthreads();
 
-    if (warp == 3) { wave_compute_store.template operator()<3, 0>(); }
+    if (warp == 3) {
+        wave_compute_store(std::integral_constant<int, 3>{}, std::integral_constant<int, 0>{});
+    }
     __syncthreads();
 
     // === Phase WY-E: +I on diagonal of T_inv (no HBM write; sync fused into WU-A) ===

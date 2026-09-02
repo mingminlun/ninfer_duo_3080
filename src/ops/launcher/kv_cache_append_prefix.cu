@@ -72,11 +72,11 @@ kv_cache_append_prefix_resolve_plan(std::int32_t tokens,
         envelope.max_count > static_cast<std::uint32_t>(tokens)) {
         throw std::invalid_argument("kv_cache_append_prefix plan: invalid execution envelope");
     }
-    return {
-        .tokens    = tokens,
-        .min_count = static_cast<std::int32_t>(envelope.min_count),
-        .max_count = static_cast<std::int32_t>(envelope.max_count),
-    };
+    KVCacheAppendPrefixPlan plan;
+    plan.tokens    = tokens;
+    plan.min_count = static_cast<std::int32_t>(envelope.min_count);
+    plan.max_count = static_cast<std::int32_t>(envelope.max_count);
+    return plan;
 }
 
 void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tensor& positions,

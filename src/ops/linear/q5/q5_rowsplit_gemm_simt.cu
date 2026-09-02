@@ -115,16 +115,33 @@ void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch_simt_route<8>(x, w, out, stream);
 }
 
+struct Split2Launcher {
+    const Tensor& x;
+    const Weight& w;
+    Tensor& out;
+    cudaStream_t stream;
+    template <int Cols>
+    void operator()() const { dispatch_split2_cols<Cols>(x, w, out, stream); }
+};
+
+struct Split4Launcher {
+    const Tensor& x;
+    const Weight& w;
+    Tensor& out;
+    cudaStream_t stream;
+    template <int Cols>
+    void operator()() const { launch_split4<Cols>(x, w, out, stream); }
+};
+
 void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    dispatch_exact_cols(x.ne[1],
-                        [&]<int Cols>() { dispatch_split2_cols<Cols>(x, w, out, stream); });
+    dispatch_exact_cols(x.ne[1], Split2Launcher{x, w, out, stream});
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
-    dispatch_exact_cols(x.ne[1], [&]<int Cols>() { launch_split4<Cols>(x, w, out, stream); });
+    dispatch_exact_cols(x.ne[1], Split4Launcher{x, w, out, stream});
     CUDA_CHECK(cudaGetLastError());
 }
 

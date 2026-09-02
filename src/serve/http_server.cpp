@@ -315,13 +315,26 @@ void HttpServer::register_routes() {
     });
 }
 
+namespace {
+bool model_matches(const std::string& requested, const std::string& public_id) {
+    if (requested.empty() || requested == "default" || requested == public_id) {
+        return true;
+    }
+    std::string req_norm = requested;
+    std::string pub_norm = public_id;
+    for (char& c : req_norm) { if (c == '_' || c == '.') c = '-'; }
+    for (char& c : pub_norm) { if (c == '_' || c == '.') c = '-'; }
+    return req_norm == pub_norm;
+}
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    if (!model_matches(id, public_model_id_)) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -350,7 +363,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        if (request.model != public_model_id_) {
+        if (!model_matches(request.model, public_model_id_)) {
             ApiError error;
             error.status  = 404;
             error.type    = "invalid_request_error";

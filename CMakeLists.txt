@@ -1,18 +1,26 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
+# The current implementation supports Ampere sm_86 and early Ada sm_89. Set and validate the
 # architecture before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89|120a)$")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=86, 89, or 120a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
+
+# NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
+# PUBLIC for its own consumers, but that link is PRIVATE through ninfer_engine, so apps and tests
+# would not otherwise see it. Defining it globally keeps a single consistent answer for every
+# target, including apps/ninfer-perplexity, whose upstream default KV profile is FP8.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+  add_compile_definitions(NINFER_SM8X_COMPAT=1)
+endif()
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
@@ -21,9 +29,26 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
+if(MSVC)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # /Zc:__cplusplus makes MSVC report the standard it is actually compiling. Without it the macro
+  # stays at 199711L even under /std:c++20, and CUDA's <vector_types.h> then hides the constexpr
+  # dim3 constructors behind its own __cplusplus >= 201103L test, which fails to compile every
+  # translation unit that builds a dim3 in a constant expression.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
+  # the project-wide /MD runtime. Keep one CRT in the final process.
+  add_link_options(/NODEFAULTLIB:LIBCMT)
+endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -33,9 +58,9 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
   set(CMAKE_JOB_POOL_LINK cuda_link)
 endif()
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
   message(FATAL_ERROR
-    "NInfer requires CUDA 13.1 or newer; found CUDA compiler "
+    "NInfer requires CUDA 12.8 or newer; found CUDA compiler "
     "${CMAKE_CUDA_COMPILER_VERSION}")
 endif()
 
@@ -55,11 +80,18 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+if(WIN32)
+  set(NINFER_CUDART_TARGET CUDA::cudart_static)
+else()
+  set(NINFER_CUDART_TARGET CUDA::cudart)
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
   libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
 endif()
 find_package(Threads REQUIRED)
 

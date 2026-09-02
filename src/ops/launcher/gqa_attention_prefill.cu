@@ -117,6 +117,54 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     }
 }
 
+struct PromptAttentionLauncher {
+    const Tensor& q;
+    const Tensor& positions;
+    float scale;
+    const PagedKVLayerView& cache;
+    const GqaPrefillDirectMetadata& metadata;
+    Tensor& out;
+    cudaStream_t stream;
+    template <typename Geometry>
+    void operator()() const {
+        gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
+                                                            out, stream);
+    }
+};
+
+struct KvAppendLauncher {
+    const Tensor& k;
+    const Tensor& v;
+    const Tensor& positions;
+    PagedKVLayerView cache;
+    const GqaPrefillDirectMetadata& metadata;
+    cudaStream_t stream;
+    template <typename Geometry>
+    void operator()() const {
+        gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+    }
+};
+
+template <bool Masked>
+struct PromptBatchLauncher {
+    const Tensor& q;
+    const Tensor& k;
+    const Tensor& v;
+    const Tensor& positions;
+    float scale;
+    PagedKVBatchLayerView cache;
+    const GqaPrefillBatchMetadata<Masked>& metadata;
+    Tensor& out;
+    cudaStream_t stream;
+
+    template <typename Geometry>
+    void operator()() const {
+        gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+        gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                            metadata, out, stream);
+    }
+};
+
 } // namespace
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
@@ -124,43 +172,37 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
-        gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
-                                                            out, stream);
-    });
+    dispatch_gqa_geometry(q.ne[1], PromptAttentionLauncher{q, positions, scale, cache, metadata,
+                                                           out, stream});
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    dispatch_gqa_kv_geometry(k.ne[1], [&]<typename Geometry>() {
-        gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
-    });
+    dispatch_gqa_kv_geometry(k.ne[1], KvAppendLauncher{k, v, positions, cache, metadata, stream});
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  Tensor& out, cudaStream_t stream) {
-    const auto launch = [&]<bool Masked>() {
-        const GqaPrefillBatchMetadata<Masked> metadata{
-            .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
-            .valid_columns =
-                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-            .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
-            .table_stride = cache.block_tables.ne[0],
-        };
-        dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
-            gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
-                                                                metadata, out, stream);
-        });
-    };
     if (valid_columns.data == nullptr) {
-        launch.template operator()<false>();
+        GqaPrefillBatchMetadata<false> metadata;
+        metadata.tables = static_cast<const std::int32_t*>(cache.block_tables.data);
+        metadata.valid_columns = nullptr;
+        metadata.table_rows = static_cast<const std::int32_t*>(table_rows.data);
+        metadata.table_stride = cache.block_tables.ne[0];
+        dispatch_gqa_geometry(q.ne[1], PromptBatchLauncher<false>{q, k, v, positions, scale, cache,
+                                                                  metadata, out, stream});
     } else {
-        launch.template operator()<true>();
+        GqaPrefillBatchMetadata<true> metadata;
+        metadata.tables = static_cast<const std::int32_t*>(cache.block_tables.data);
+        metadata.valid_columns = static_cast<const std::int32_t*>(valid_columns.data);
+        metadata.table_rows = static_cast<const std::int32_t*>(table_rows.data);
+        metadata.table_stride = cache.block_tables.ne[0];
+        dispatch_gqa_geometry(q.ne[1], PromptBatchLauncher<true>{q, k, v, positions, scale, cache,
+                                                                 metadata, out, stream});
     }
 }
 

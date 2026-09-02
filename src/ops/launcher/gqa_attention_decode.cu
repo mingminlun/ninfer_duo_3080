@@ -113,110 +113,149 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_i8_tiled_instance(const Tensor& q, CacheInput input, const Tensor& pos,
+                             float scale, PagedKVBatchLayerView cache,
+                             const GqaSmallTInvocation& invocation, std::int32_t logical_capacity,
+                             std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                             Tensor& partial_l, cudaStream_t stream) {
+    Tensor& cache_k       = cache.k_pages;
+    Tensor& cache_v       = cache.v_pages;
+    Tensor& cache_k_scale = cache.k_scale_pages;
+    Tensor& cache_v_scale = cache.v_scale_pages;
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    constexpr std::size_t kDynamicBytes =
+        DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
+    if constexpr (DynamicArena) {
+        ensure_func_attr_per_device(
+            gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                 MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                 MultiBatch, Masked, CacheInput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+    }
+    gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
+                                         KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
+        <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+            logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+}
+
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
                           Tensor& partial_l, cudaStream_t stream) {
-    Tensor& cache_k       = cache.k_pages;
-    Tensor& cache_v       = cache.v_pages;
-    Tensor& cache_k_scale = cache.k_scale_pages;
-    Tensor& cache_v_scale = cache.v_scale_pages;
-    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
-        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-        constexpr std::size_t kDynamicBytes =
-            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
-        if constexpr (DynamicArena) {
-            ensure_func_attr_per_device(
-                gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                     MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                     MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-        }
-        gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                             KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>
-            <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data), input,
-                static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
-                static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
-                static_cast<__half*>(cache_v_scale.data),
-                static_cast<const std::int32_t*>(cache.block_tables.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.table_rows == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
-                cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
-    };
     if constexpr (TokenTile == 6) {
-        // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
-        // loop iterations; dynamic smem avoids penalizing the long-context path.
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<24, 1, 32, false>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 24, 1, 32, true, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         } else if (implementation_window <= 2054) {
-            launch.template operator()<12, 1, 32, false>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 12, 1, 32, true, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         } else if (implementation_window <= 8198) {
-            launch.template operator()<12, 1, 64, true>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 12, 1, 64, true, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 6, 2, 32, true, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
-            // Two Q row tiles for the 27B group of six.
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<32, 1, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 32, 1, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             } else if (implementation_window <= 1029) {
-                launch.template operator()<16, 1, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 16, 1, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             } else {
-                launch.template operator()<8, 2, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 8, 2, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             }
         } else {
-            // Three Q row tiles for the 35B group of eight. The 24/12-warp
-            // routes retain eight/four consumer warps per tile; the 6-warp
-            // route is reserved for long windows where CTA residency wins.
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 24, 1, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             } else if (implementation_window <= 1029) {
-                launch.template operator()<24, 1, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 24, 1, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             } else if (implementation_window <= 4096) {
-                launch.template operator()<12, 1, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 12, 1, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             } else {
-                launch.template operator()<6, 2, 32, false>();
+                launch_i8_tiled_instance<Geometry, TokenTile, 6, 2, 32, true, MultiBatch, Masked>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                    partial_m, partial_l, stream);
             }
         }
     } else if constexpr (TokenTile == 4) {
         if (implementation_window <= 1029) {
-            launch.template operator()<16, 1, 32, false>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 16, 1, 32, false, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         } else {
-            launch.template operator()<8, 2, 32, false>();
+            launch_i8_tiled_instance<Geometry, TokenTile, 8, 2, 32, false, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
         }
     } else {
-        launch.template operator()<8, 2, 32, false>();
+        launch_i8_tiled_instance<Geometry, TokenTile, 8, 2, 32, false, MultiBatch, Masked>(
+            q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+            partial_m, partial_l, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
-    return {
-        .k_pages       = cache.k_pages,
-        .v_pages       = cache.v_pages,
-        .k_scale_pages = cache.k_scale_pages,
-        .v_scale_pages = cache.v_scale_pages,
-        .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
-        .head_dim      = cache.head_dim,
-        .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
-        .quant_group   = cache.quant_group,
-    };
+    PagedKVBatchLayerView v;
+    v.k_pages       = cache.k_pages;
+    v.v_pages       = cache.v_pages;
+    v.k_scale_pages = cache.k_scale_pages;
+    v.v_scale_pages = cache.v_scale_pages;
+    v.block_tables  = cache.block_table.view({cache.block_table.ne[0], 1});
+    v.head_dim      = cache.head_dim;
+    v.num_kv_heads  = cache.num_kv_heads;
+    v.dtype         = cache.dtype;
+    v.quant_group   = cache.quant_group;
+    return v;
 }
 
 } // namespace
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
+
+struct SplitCapacitySelector {
+    GqaExecutionEnvelope envelope;
+    std::int32_t tokens;
+    DType cache_dtype;
+    template <typename Geometry>
+    std::int32_t operator()() const {
+        return gqa_small_t_launch_capacity<Geometry>(envelope, tokens, cache_dtype);
+    }
+};
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
@@ -224,9 +263,57 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
-    return dispatch_gqa_geometry(q_heads, [&]<typename Geometry>() {
-        return gqa_small_t_launch_capacity<Geometry>(envelope, tokens, cache_dtype);
-    });
+    return dispatch_gqa_geometry(q_heads, SplitCapacitySelector{envelope, tokens, cache_dtype});
+}
+
+template <typename Geometry, typename CacheInput, int Tokens, int Warps>
+void dispatch_small_t_profile(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                              PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                              std::int32_t logical_capacity, std::int32_t implementation_window,
+                              std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                              Tensor& partial_l, cudaStream_t stream) {
+    const bool masked = invocation.valid_columns != nullptr;
+    if (cache.dtype == DType::I8) {
+        if (invocation.batch_size == 1) {
+            if (masked) {
+                launch_tc_partial_i8<Geometry, Tokens, false, true>(
+                    q, input, pos, scale, cache, invocation, logical_capacity,
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);
+            } else {
+                launch_tc_partial_i8<Geometry, Tokens, false, false>(
+                    q, input, pos, scale, cache, invocation, logical_capacity,
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);
+            }
+        } else if (masked) {
+            launch_tc_partial_i8<Geometry, Tokens, true, true>(
+                q, input, pos, scale, cache, invocation, logical_capacity,
+                implementation_window, splits, partial_acc, partial_m, partial_l, stream);
+        } else {
+            launch_tc_partial_i8<Geometry, Tokens, true, false>(
+                q, input, pos, scale, cache, invocation, logical_capacity,
+                implementation_window, splits, partial_acc, partial_m, partial_l, stream);
+        }
+    } else {
+        if (invocation.batch_size == 1) {
+            if (masked) {
+                launch_tc_partial_bf16<Geometry, Tokens, Warps, false, true>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,
+                    partial_acc, partial_m, partial_l, stream);
+            } else {
+                launch_tc_partial_bf16<Geometry, Tokens, Warps, false, false>(
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,
+                    partial_acc, partial_m, partial_l, stream);
+            }
+        } else if (masked) {
+            launch_tc_partial_bf16<Geometry, Tokens, Warps, true, true>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits,
+                partial_acc, partial_m, partial_l, stream);
+        } else {
+            launch_tc_partial_bf16<Geometry, Tokens, Warps, true, false>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits,
+                partial_acc, partial_m, partial_l, stream);
+        }
+    }
 }
 
 template <typename Geometry, typename CacheInput>
@@ -241,105 +328,125 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
-    // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
-    // geometry inside launch_tc_partial_i8.
-#define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
-    do {                                                                                           \
-        const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
-                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
-                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
-                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
-            } else {                                                                               \
-                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
-            }                                                                                      \
-        };                                                                                         \
-        const bool masked = invocation.valid_columns != nullptr;                                   \
-        if (invocation.batch_size == 1) {                                                          \
-            if (masked) {                                                                          \
-                launch_profile.template operator()<false, true>();                                 \
-            } else {                                                                               \
-                launch_profile.template operator()<false, false>();                                \
-            }                                                                                      \
-        } else if (masked) {                                                                       \
-            launch_profile.template operator()<true, true>();                                      \
-        } else {                                                                                   \
-            launch_profile.template operator()<true, false>();                                     \
-        }                                                                                          \
-    } while (0)
-
     switch (invocation.width) {
     case 1:
-        NINFER_GQA_SMALL_T_DISPATCH(1, 2);
+        dispatch_small_t_profile<Geometry, CacheInput, 1, 2>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     case 2:
-        NINFER_GQA_SMALL_T_DISPATCH(2, 4);
+        dispatch_small_t_profile<Geometry, CacheInput, 2, 4>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     case 3:
-        NINFER_GQA_SMALL_T_DISPATCH(3, 4);
+        dispatch_small_t_profile<Geometry, CacheInput, 3, 4>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     case 4:
-        NINFER_GQA_SMALL_T_DISPATCH(4, 4);
+        dispatch_small_t_profile<Geometry, CacheInput, 4, 4>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     case 5:
-        NINFER_GQA_SMALL_T_DISPATCH(5, 4);
+        dispatch_small_t_profile<Geometry, CacheInput, 5, 4>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     case 6:
-        NINFER_GQA_SMALL_T_DISPATCH(6, 4);
+        dispatch_small_t_profile<Geometry, CacheInput, 6, 4>(
+            q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
+            splits, partial_acc, partial_m, partial_l, stream);
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
-#undef NINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
-    const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                   Offset>
-            <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(pos.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
-    };
-    const bool masked         = invocation.valid_columns != nullptr;
-    const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
-        if (invocation.column_begin == 0) {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, false>();
-        } else {
-            launch_reduce.template operator()<Int8, MultiBatch, Masked, true>();
-        }
-    };
-    const auto launch_for_dtype = [&]<bool Int8>() {
-        if (invocation.batch_size == 1) {
+
+    const bool int8_mode   = cache.dtype == DType::I8;
+    const bool multi_batch = invocation.batch_size != 1;
+    const bool masked      = invocation.valid_columns != nullptr;
+    const bool offset      = invocation.column_begin != 0;
+
+#define NINFER_LAUNCH_REDUCE(I8, MB, MASK, OFF)                                                    \
+    gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, I8, MB, MASK, OFF>                \
+        <<<reduce_grid, kReduceBlock, 0, stream>>>(                                                \
+            static_cast<const __nv_bfloat16*>(partial_acc.data),                                   \
+            static_cast<const float*>(partial_m.data), static_cast<const float*>(partial_l.data),  \
+            static_cast<const std::int32_t*>(pos.data),                                            \
+            invocation.valid_columns == nullptr                                                    \
+                ? nullptr                                                                          \
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),                \
+            invocation.width, invocation.full_width, invocation.column_begin,                      \
+            invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data))
+
+    if (int8_mode) {
+        if (multi_batch) {
             if (masked) {
-                launch_profile.template operator()<Int8, false, true>();
+                if (offset) { NINFER_LAUNCH_REDUCE(true, true, true, true); }
+                else { NINFER_LAUNCH_REDUCE(true, true, true, false); }
             } else {
-                launch_profile.template operator()<Int8, false, false>();
+                if (offset) { NINFER_LAUNCH_REDUCE(true, true, false, true); }
+                else { NINFER_LAUNCH_REDUCE(true, true, false, false); }
             }
-        } else if (masked) {
-            launch_profile.template operator()<Int8, true, true>();
         } else {
-            launch_profile.template operator()<Int8, true, false>();
+            if (masked) {
+                if (offset) { NINFER_LAUNCH_REDUCE(true, false, true, true); }
+                else { NINFER_LAUNCH_REDUCE(true, false, true, false); }
+            } else {
+                if (offset) { NINFER_LAUNCH_REDUCE(true, false, false, true); }
+                else { NINFER_LAUNCH_REDUCE(true, false, false, false); }
+            }
         }
-    };
-    if (cache.dtype == DType::I8) {
-        launch_for_dtype.template operator()<true>();
     } else {
-        launch_for_dtype.template operator()<false>();
+        if (multi_batch) {
+            if (masked) {
+                if (offset) { NINFER_LAUNCH_REDUCE(false, true, true, true); }
+                else { NINFER_LAUNCH_REDUCE(false, true, true, false); }
+            } else {
+                if (offset) { NINFER_LAUNCH_REDUCE(false, true, false, true); }
+                else { NINFER_LAUNCH_REDUCE(false, true, false, false); }
+            }
+        } else {
+            if (masked) {
+                if (offset) { NINFER_LAUNCH_REDUCE(false, false, true, true); }
+                else { NINFER_LAUNCH_REDUCE(false, false, true, false); }
+            } else {
+                if (offset) { NINFER_LAUNCH_REDUCE(false, false, false, true); }
+                else { NINFER_LAUNCH_REDUCE(false, false, false, false); }
+            }
+        }
     }
+#undef NINFER_LAUNCH_REDUCE
     CUDA_CHECK(cudaGetLastError());
 }
+
+struct SmallTDirectLauncher {
+    const Tensor& q;
+    const GqaAppendInput& input;
+    const Tensor& pos;
+    float scale;
+    PagedKVBatchLayerView cache;
+    const GqaSmallTInvocation& invocation;
+    GqaExecutionEnvelope envelope;
+    Tensor& partial_acc;
+    Tensor& partial_m;
+    Tensor& partial_l;
+    Tensor& out;
+    cudaStream_t stream;
+
+    template <typename Geometry>
+    void operator()() const {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                   envelope, partial_acc, partial_m, partial_l, out,
+                                                   stream);
+    }
+};
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& pos, const Tensor& valid_columns,
@@ -350,20 +457,40 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   Tensor& out, cudaStream_t stream) {
     const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                static_cast<const __nv_bfloat16*>(v.data)};
-    const GqaSmallTInvocation invocation{
-        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
-        .table_rows    = &table_rows,
-        .full_width    = q.ne[2],
-        .column_begin  = column_begin,
-        .width         = width,
-        .batch_size    = q.ne[3],
-    };
-    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
-        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+    GqaSmallTInvocation invocation;
+    invocation.valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns;
+    invocation.table_rows    = &table_rows;
+    invocation.full_width    = q.ne[2];
+    invocation.column_begin  = column_begin;
+    invocation.width         = width;
+    invocation.batch_size    = q.ne[3];
+
+    dispatch_gqa_geometry(q.ne[1], SmallTDirectLauncher{q, input, pos, scale, cache, invocation,
+                                                        envelope, partial_acc, partial_m, partial_l,
+                                                        out, stream});
+}
+
+struct SmallTCachedLauncher {
+    const Tensor& q;
+    const GqaCachedInput& input;
+    const Tensor& pos;
+    float scale;
+    PagedKVBatchLayerView batch_cache;
+    const GqaSmallTInvocation& invocation;
+    GqaExecutionEnvelope envelope;
+    Tensor& partial_acc;
+    Tensor& partial_m;
+    Tensor& partial_l;
+    Tensor& out;
+    cudaStream_t stream;
+
+    template <typename Geometry>
+    void operator()() const {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache, invocation,
                                                    envelope, partial_acc, partial_m, partial_l, out,
                                                    stream);
-    });
-}
+    }
+};
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
                                          const PagedKVLayerView& cache,
@@ -371,20 +498,17 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                          cudaStream_t stream) {
     const GqaCachedInput input{};
-    const GqaSmallTInvocation invocation{
-        .valid_columns = nullptr,
-        .table_rows    = nullptr,
-        .full_width    = q.ne[2],
-        .column_begin  = 0,
-        .width         = q.ne[2],
-        .batch_size    = 1,
-    };
+    GqaSmallTInvocation invocation;
+    invocation.valid_columns = nullptr;
+    invocation.table_rows    = nullptr;
+    invocation.full_width    = q.ne[2];
+    invocation.column_begin  = 0;
+    invocation.width         = q.ne[2];
+    invocation.batch_size    = 1;
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
-    dispatch_gqa_geometry(q.ne[1], [&]<typename Geometry>() {
-        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                   envelope, partial_acc, partial_m, partial_l, out,
-                                                   stream);
-    });
+    dispatch_gqa_geometry(q.ne[1], SmallTCachedLauncher{q, input, pos, scale, batch_cache,
+                                                        invocation, envelope, partial_acc,
+                                                        partial_m, partial_l, out, stream});
 }
 
 } // namespace ninfer::ops::detail

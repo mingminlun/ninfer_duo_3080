@@ -1,6 +1,13 @@
 #pragma once
 
+#include <cstdlib>
+
+#if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
+#define NINFER_HAS_NVTX 1
+#else
+#define NINFER_HAS_NVTX 0
+#endif
 
 #include <array>
 #include <cstddef>
@@ -51,6 +58,8 @@ enum class Name : std::size_t {
     SparseMoeDecode,
     Count,
 };
+
+#if NINFER_HAS_NVTX
 
 [[nodiscard]] inline std::uint32_t color(Category category) noexcept {
     switch (category) {
@@ -163,5 +172,19 @@ public:
 private:
     nvtxDomainHandle_t domain_;
 };
+
+#else
+
+class ScopedRange {
+public:
+    explicit ScopedRange(Name, Category, std::uint64_t = 0) noexcept {}
+    ScopedRange(const ScopedRange&)            = delete;
+    ScopedRange& operator=(const ScopedRange&) = delete;
+    ScopedRange(ScopedRange&&)                 = delete;
+    ScopedRange& operator=(ScopedRange&&)      = delete;
+    ~ScopedRange() noexcept {}
+};
+
+#endif
 
 } // namespace ninfer::nvtx

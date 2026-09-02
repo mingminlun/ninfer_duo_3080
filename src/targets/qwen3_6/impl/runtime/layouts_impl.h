@@ -694,9 +694,15 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("--tp 2 does not support Vision in this build");
         }
     }
+#ifndef NINFER_SM8X_COMPAT
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
+#else
+    if (device.sm() < 86) {
+        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability >= 8.6");
+    }
+#endif
     return effective_max_context;
 }
 

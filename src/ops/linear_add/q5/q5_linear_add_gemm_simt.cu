@@ -62,11 +62,20 @@ void dispatch_cols(std::int32_t cols, Launch&& launch) {
     }
 }
 
+struct LinearAddLauncher {
+    const Tensor& x;
+    const Weight& w;
+    Tensor& residual_out;
+    cudaStream_t stream;
+    template <int Cols>
+    void operator()() const { dispatch_shape<Cols>(x, w, residual_out, stream); }
+};
+
 } // namespace
 
 void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                        cudaStream_t stream) {
-    dispatch_cols(x.ne[1], [&]<int Cols>() { dispatch_shape<Cols>(x, w, residual_out, stream); });
+    dispatch_cols(x.ne[1], LinearAddLauncher{x, w, residual_out, stream});
     CUDA_CHECK(cudaGetLastError());
 }
 

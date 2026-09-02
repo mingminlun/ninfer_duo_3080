@@ -52,8 +52,6 @@ SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelo
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("swa plan: invalid envelope");
     }
-    // Graph envelopes whose longest context fits three key tiles avoid the second kernel and
-    // workspace round trip. At four tiles, split-KV is already faster for every qualified T.
     constexpr std::uint32_t direct_context_limit = 96;
     const bool direct                            = envelope.max_context <= direct_context_limit;
     constexpr std::int32_t key_block             = 32;
@@ -61,13 +59,13 @@ SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelo
     const std::int32_t context_tiles =
         static_cast<std::int32_t>((context_rows + key_block - 1u) / key_block);
     constexpr std::int32_t split_limit = 32;
-    return {
-        .route          = direct ? SwaRoute::Direct : SwaRoute::SplitKv,
-        .tokens         = tokens,
-        .warps          = (tokens + 3) / 4,
-        .split_capacity = direct ? 1 : std::min(split_limit, std::max(1, context_tiles)),
-        .max_context    = static_cast<std::int32_t>(envelope.max_context),
-    };
+    SwaPlan plan;
+    plan.route          = direct ? SwaRoute::Direct : SwaRoute::SplitKv;
+    plan.tokens         = tokens;
+    plan.warps          = (tokens + 3) / 4;
+    plan.split_capacity = direct ? 1 : std::min(split_limit, std::max(1, context_tiles));
+    plan.max_context    = static_cast<std::int32_t>(envelope.max_context);
+    return plan;
 }
 
 const char* swa_route_name(SwaRoute route) {
@@ -80,12 +78,26 @@ const char* swa_route_name(SwaRoute route) {
     return "unknown";
 }
 
-void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
-                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
-                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                cudaStream_t stream) {
-    dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
+namespace {
+
+struct SwaLauncher {
+    const Tensor& q;
+    const Tensor& query_k;
+    const Tensor& query_v;
+    const Tensor& positions;
+    const Tensor& valid_columns;
+    const Tensor& lanes;
+    float scale;
+    const CyclicKVCacheLayerView& context;
+    const SwaPlan& plan;
+    Tensor& partial_acc;
+    Tensor& partial_m;
+    Tensor& partial_l;
+    Tensor& out;
+    cudaStream_t stream;
+
+    template <int Tokens, int Warps>
+    void operator()() const {
         const bool direct = plan.route == SwaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
             plan.split_capacity > kSwaMaxCandidateSplit || (direct && plan.split_capacity != 1)) {
@@ -140,10 +152,23 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),
-                static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
-                plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
+                static_cast<const std::int32_t*>(valid_columns.data),
+                plan.max_context, plan.split_capacity,
+                static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
-    });
+    }
+};
+
+} // namespace
+
+void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                cudaStream_t stream) {
+    SwaLauncher launcher{q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                         plan, partial_acc, partial_m, partial_l, out, stream};
+    dispatch_tokens(q.ne[2], launcher);
 }
 
 } // namespace ninfer::ops::detail

@@ -10,6 +10,10 @@
 #include <utility>
 
 namespace ninfer::ops::detail {
+
+void w8_linear_add_exact_t_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
+                                  cudaStream_t stream);
+
 namespace {
 
 constexpr int kRows           = 2048;
@@ -27,9 +31,14 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
+#if defined(NINFER_SM8X_COMPAT)
+    constexpr int KWarps    = 4;
+    constexpr int MinBlocks = 2;
+#else
     constexpr int KWarps =
         Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);
     constexpr int MinBlocks = Hidden == 4096 ? (KWarps == 16 ? 1 : 2) : (ActiveCols <= 32 ? 2 : 3);
+#endif
     constexpr auto ScaleAccess =
         ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
     constexpr auto ActivationCache =
@@ -59,6 +68,7 @@ constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
 constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
 
+#if !defined(NINFER_SM8X_COMPAT)
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
                    cudaStream_t stream) {
@@ -74,19 +84,45 @@ void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residual_out,
                            cudaStream_t stream) {
-    if (weight.k == 4096) {
-        launch_medium<4096, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
-    } else {
+    if (weight.k == 6144) {
         launch_medium<6144, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
+    } else {
+        launch_medium<4096, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
+    }
+}
+#endif
+
+void launch_w8_linear_add_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
+                                            cudaStream_t stream) {
+    if (x.ne[1] < 33) {
+        throw std::invalid_argument("W8 exact-T composite requires T>=33");
+    }
+    std::int32_t offset = 0;
+    while (x.ne[1] - offset >= 32) {
+        const Tensor x_slice = x.slice(1, offset, 32);
+        Tensor out_slice     = out.slice(1, offset, 32);
+        w8_linear_add_exact_t_launch(x_slice, w, out_slice, stream);
+        offset += 32;
+    }
+    const std::int32_t tail = x.ne[1] - offset;
+    if (tail >= 1) {
+        const Tensor x_slice = x.slice(1, offset, tail);
+        Tensor out_slice     = out.slice(1, offset, tail);
+        w8_linear_add_exact_t_launch(x_slice, w, out_slice, stream);
     }
 }
 
 } // namespace
 
-void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
-                                     cudaStream_t stream) {
+void w8_linear_add_exact_t_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
+                                  cudaStream_t stream) {
+    if (x.ne[0] != weight.k || residual_out.ne[0] != kRows || residual_out.ne[1] != x.ne[1] ||
+        weight.n != kRows || (weight.k != 4096 && weight.k != 6144) ||
+        weight.padded_shape[1] != weight.k) {
+        throw std::invalid_argument("W8 linear_add exact-T: invalid problem");
+    }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
-        throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
+        throw std::invalid_argument("W8 linear_add exact-T: unsupported T");
     }
     if (weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
@@ -96,12 +132,20 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
+void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                    cudaStream_t stream) {
+    w8_linear_add_exact_t_launch(x, w, residual_out, stream);
+}
+
 void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
                                         cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
     }
+#if defined(NINFER_SM8X_COMPAT)
+    launch_w8_linear_add_exact_t_composite(x, weight, residual_out, stream);
+#else
     if (t <= 64) {
         dispatch_medium_shape<64, 8, 4, 1>(x, weight, residual_out, stream);
     } else if (t == 65) {
@@ -121,6 +165,7 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     } else {
         dispatch_medium_shape<128, 4, 8, 1>(x, weight, residual_out, stream);
     }
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 

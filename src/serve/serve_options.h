@@ -33,9 +33,9 @@ struct ServeOptions {
     double yarn_factor                     = 4.0;
     std::uint32_t yarn_origin              = 262144;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t max_pending_requests     = 16;
-    std::uint32_t pending_timeout_ms       = 30000;
+    std::uint32_t max_concurrency          = 4;
+    std::uint32_t max_pending_requests     = 64;
+    std::uint32_t pending_timeout_ms       = 600000;
     std::uint32_t prefill_chunk            = 1024;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

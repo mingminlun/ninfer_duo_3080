@@ -28,6 +28,9 @@ venv/
 *.bin
 *.safetensors
 *.gguf
+*.ninfer
+model/
+models/
 out/
 *.log
 

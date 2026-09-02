@@ -331,12 +331,14 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     }
 }
 
-} // namespace
+struct SparseMoeStage12Launcher {
+    const Tensor& x;
+    const SparseMoeWeights& weights;
+    const SparseMoeSmallTWorkspace& workspace;
+    cudaStream_t stream;
 
-void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
-                               Tensor& destination, const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    dispatch_tokens(plan.tokens, [&]<int Tokens>() {
+    template <int Tokens>
+    void operator()() const {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
                           static_cast<float*>(workspace.scratch.data), stream);
@@ -344,7 +346,15 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                           static_cast<int*>(workspace.token_ids.data),
                           static_cast<float*>(workspace.token_alpha.data),
                           static_cast<float*>(workspace.shared_scale.data), stream);
-    });
+    }
+};
+
+} // namespace
+
+void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoeSmallTPlan& plan,
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+    dispatch_tokens(plan.tokens, SparseMoeStage12Launcher{x, weights, workspace, stream});
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }

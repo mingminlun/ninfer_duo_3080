@@ -72,13 +72,13 @@ BidirectionalGqaPlan bidirectional_gqa_resolve_plan(std::int32_t tokens,
         static_cast<std::uint32_t>(key_block);
     const std::int32_t splits =
         direct ? 1 : std::min(split_limit, std::max(1, static_cast<std::int32_t>(envelope_tiles)));
-    return {
-        .route          = direct ? BidirectionalGqaRoute::Direct : BidirectionalGqaRoute::SplitKv,
-        .tokens         = tokens,
-        .warps          = warps,
-        .key_block      = key_block,
-        .split_capacity = splits,
-    };
+    BidirectionalGqaPlan plan;
+    plan.route          = direct ? BidirectionalGqaRoute::Direct : BidirectionalGqaRoute::SplitKv;
+    plan.tokens         = tokens;
+    plan.warps          = warps;
+    plan.key_block      = key_block;
+    plan.split_capacity = splits;
+    return plan;
 }
 
 const char* bidirectional_gqa_route_name(BidirectionalGqaRoute route) {
@@ -91,14 +91,60 @@ const char* bidirectional_gqa_route_name(BidirectionalGqaRoute route) {
     return "unknown";
 }
 
-void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
-                                        const Tensor& query_v, const Tensor& context_lengths,
-                                        const Tensor& valid_columns, const Tensor& table_rows,
-                                        float scale, const PagedKVBatchLayerView& context,
-                                        const BidirectionalGqaPlan& plan, Tensor& partial_acc,
-                                        Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                        cudaStream_t stream) {
-    dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
+namespace {
+
+struct BidirectionalGqaLauncher {
+    const Tensor& q;
+    const Tensor& query_k;
+    const Tensor& query_v;
+    const Tensor& context_lengths;
+    const Tensor& valid_columns;
+    const Tensor& table_rows;
+    float scale;
+    const PagedKVBatchLayerView& context;
+    const BidirectionalGqaPlan& plan;
+    Tensor& partial_acc;
+    Tensor& partial_m;
+    Tensor& partial_l;
+    Tensor& out;
+    cudaStream_t stream;
+
+    template <int KeyBlock, int Tokens, int Warps>
+    void launch_split() const {
+        constexpr std::size_t SmemBytes =
+            2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
+        const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
+        bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
+            <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const __nv_bfloat16*>(query_k.data),
+                static_cast<const __nv_bfloat16*>(query_v.data),
+                static_cast<const std::int32_t*>(context_lengths.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<const __nv_bfloat16*>(context.k_pages.data),
+                static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                static_cast<const std::int32_t*>(context.block_tables.data),
+                context.k_pages.ne[2], context.block_tables.ne[0],
+                context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
+                static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+        const dim3 reduce_grid(kBidirectionalGqaQHeads, Tokens, q.ne[3]);
+        bidirectional_gqa_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(partial_acc.data),
+            static_cast<const float*>(partial_m.data),
+            static_cast<const float*>(partial_l.data),
+            static_cast<const std::int32_t*>(context_lengths.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
+            static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    template <int Tokens, int Warps>
+    void operator()() const {
         const bool direct = plan.route == BidirectionalGqaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
             plan.split_capacity > kBidirectionalGqaMaxSplit) {
@@ -136,50 +182,31 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
         }
 
-        const auto launch_split = [&]<int KeyBlock>() {
-            constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
-            const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
-            bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
-                <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const __nv_bfloat16*>(query_k.data),
-                    static_cast<const __nv_bfloat16*>(query_v.data),
-                    static_cast<const std::int32_t*>(context_lengths.data),
-                    static_cast<const std::int32_t*>(valid_columns.data),
-                    static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
-                    static_cast<const std::int32_t*>(context.block_tables.data),
-                    context.k_pages.ne[2], context.block_tables.ne[0],
-                    context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
-                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-                    static_cast<__nv_bfloat16*>(out.data));
-            CUDA_CHECK(cudaGetLastError());
-            const dim3 reduce_grid(kBidirectionalGqaQHeads, Tokens, q.ne[3]);
-            bidirectional_gqa_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(context_lengths.data),
-                static_cast<const std::int32_t*>(valid_columns.data),
-                context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
-                static_cast<__nv_bfloat16*>(out.data));
-            CUDA_CHECK(cudaGetLastError());
-        };
         if (plan.key_block == 32) {
-            launch_split.template operator()<32>();
+            launch_split<32, Tokens, Warps>();
             return;
         }
-        if constexpr (Tokens > 8) {
-            if (plan.key_block == 64) {
-                launch_split.template operator()<64>();
-                return;
-            }
+        if (Tokens > 8 && plan.key_block == 64) {
+            launch_split<64, Tokens, Warps>();
+            return;
         }
-        throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
-    });
+        throw std::invalid_argument("bidirectional_gqa_attention: unsupported key_block");
+    }
+};
+
+} // namespace
+
+void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
+                                        const Tensor& query_v, const Tensor& context_lengths,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        float scale, const PagedKVBatchLayerView& context,
+                                        const BidirectionalGqaPlan& plan, Tensor& partial_acc,
+                                        Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                        cudaStream_t stream) {
+    BidirectionalGqaLauncher launcher{q, query_k, query_v, context_lengths, valid_columns,
+                                      table_rows, scale, context, plan, partial_acc, partial_m,
+                                      partial_l, out, stream};
+    dispatch_tokens(q.ne[2], launcher);
 }
 
 } // namespace ninfer::ops::detail
